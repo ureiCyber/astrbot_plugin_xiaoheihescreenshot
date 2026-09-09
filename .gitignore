@@ -1,0 +1,40 @@
+# Local Python environments and caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Credentials and local runtime state
+.env
+.env.*
+!.env.example
+credentials.json
+cookies.json
+storage_state.json
+*.pem
+*.key
+logs/
+*.log
+
+# Local diagnostics, screenshots and old distribution bundles
+/artifacts/
+/err.txt
+/napcaterr.txt
+/0af53a83be82ef74c5c60905fcd72de7.jpeg
+/*.zip
+build/
+dist/
+*.egg-info/
+
+# Local editor and agent files
+.agents/
+.codex/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
