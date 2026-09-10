@@ -21,7 +21,7 @@
 在 AstrBot WebUI 的插件管理中，使用“从 URL 安装”入口，填入：
 
 ```text
-https://github.com/ureiCyber/astrbot_plugin_steaminfo_xiaoheihe
+https://github.com/ureiCyber/astrbot_plugin_xiaoheihescreenshot
 ```
 
 ### 手动安装
@@ -30,7 +30,7 @@ https://github.com/ureiCyber/astrbot_plugin_steaminfo_xiaoheihe
 
 ```bash
 cd <AstrBot目录>/data/plugins
-git clone https://github.com/ureiCyber/astrbot_plugin_steaminfo_xiaoheihe.git
+git clone https://github.com/ureiCyber/astrbot_plugin_xiaoheihescreenshot.git
 ```
 
 本插件依赖 Playwright 和 Pillow。请进入插件目录，在 **AstrBot 实际使用的 Python 环境**中执行：
@@ -44,7 +44,7 @@ python -m playwright install chromium
 
 后续可通过 AstrBot 插件管理的更新入口获取新代码，更新地址由 `metadata.yaml` 中的 `repo` 指定。重载插件只会重新加载本地代码，不会代替更新操作。
 
-本插件标识为 `astrbot_plugin_steaminfo_xiaoheihe`。如果已安装同名插件，请先备份配置，再选择要使用的版本和更新源，避免插件目录冲突。
+本插件标识为 `astrbot_plugin_xiaoheihescreenshot`。如果此前安装的是 `astrbot_plugin_steaminfo_xiaoheihe`，请先备份原配置并停用旧插件，再通过上述新地址安装，将需要的配置填入新插件。插件标识变更后，旧配置不会自动归入新插件；请避免同时启用两个版本而重复回复。
 
 ## 📝 使用
 
