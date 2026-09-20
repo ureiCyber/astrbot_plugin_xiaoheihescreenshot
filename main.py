@@ -3,6 +3,7 @@ import json
 import asyncio
 import base64
 import io
+import math
 from urllib.parse import quote
 from PIL import Image
 
@@ -13,18 +14,27 @@ from astrbot.api.star import Context, Star
 from astrbot.api import logger, AstrBotConfig
 
 
+# 经过实际测试的 QQ/NapCat 发送安全锁，不属于用户配置，禁止增大。
+MAX_IMAGE_DIMENSION = 16384
+MAX_IMAGE_PIXELS = 20_000_000
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
+DEVICE_SCALE_FACTOR = 2
+MIN_JPEG_QUALITY = 50
+PAGE_LOAD_TIMEOUT_MS = 60_000
+SEARCH_SELECTOR_TIMEOUT_MS = 5_000
+GAME_TAB_TIMEOUT_MS = 10_000
+# 分享页首次检查前等待应用挂载；滚动后的等待供懒加载/动态正文完成渲染。
+SHARE_APP_SETTLE_SECONDS = 4.0
+LAZY_RENDER_SETTLE_SECONDS = 5.0
+
+
 class XiaoheihePlugin(Star):
     """小黑盒游戏截图插件 - 移动端正文完整展开与裁切版"""
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
-        self.config = config
-
         self.cookies: str = config.get("cookies", "")
-        self.wait_timeout: int = int(config.get("wait_timeout", 60000))
-        self.render_delay: int = int(config.get("render_delay", 5000))
-        self.device_scale_factor: float = float(config.get("device_scale_factor", 1))
-        self.image_quality: int = int(config.get("image_quality", 95))
         self.enable_link_preview: bool = config.get("enable_link_preview", True)
         self.debug: bool = config.get("debug", False)
 
@@ -33,10 +43,6 @@ class XiaoheihePlugin(Star):
         self._browser: Browser | None = None
         self._browser_lock = asyncio.Lock()
         self._semaphore = asyncio.Semaphore(2)
-        # QQ 富媒体上传对超长图和超大文件的兼容性较差。
-        self._max_image_dimension = 16384
-        self._max_image_pixels = 20_000_000
-        self._max_image_bytes = 10 * 1024 * 1024
 
     def _log(self, message: str):
         if self.debug:
@@ -56,7 +62,7 @@ class XiaoheihePlugin(Star):
         # 伪装成 iPhone 14 Pro Max 手机，初始高度给 932
         context = await browser.new_context(
             viewport={"width": 430, "height": 932},
-            device_scale_factor=self.device_scale_factor,
+            device_scale_factor=DEVICE_SCALE_FACTOR,
             user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
             is_mobile=True,
             has_touch=True
@@ -79,8 +85,8 @@ class XiaoheihePlugin(Star):
             state = self._start_article_image_capture(page)
             last_state = state
             try:
-                await page.goto(target_url, wait_until="load", timeout=self.wait_timeout)
-                await asyncio.sleep(min(4.0, max(1.5, self.render_delay / 1000)))
+                await page.goto(target_url, wait_until="load", timeout=PAGE_LOAD_TIMEOUT_MS)
+                await asyncio.sleep(SHARE_APP_SETTLE_SECONDS)
                 snapshot = await page.evaluate("""() => ({
                     sliderCount: document.querySelectorAll(
                         '.bbs-link-img-slider, .bbs-link-img-slider-box'
@@ -678,6 +684,19 @@ class XiaoheihePlugin(Star):
         ]
 
     @staticmethod
+    def _safe_image_size(width: int, height: int) -> tuple[int, int]:
+        """Keep physical pixels intact unless a tested dimension lock is hit."""
+        if width <= 0 or height <= 0:
+            raise ValueError("Image dimensions must be positive")
+        scale = min(
+            1.0,
+            MAX_IMAGE_DIMENSION / max(width, height),
+            math.sqrt(MAX_IMAGE_PIXELS / (width * height)),
+        )
+        # Floor both axes: rounding up can cross the pixel or longest-edge lock.
+        return max(1, math.floor(width * scale)), max(1, math.floor(height * scale))
+
+    @staticmethod
     def _crop_screenshot_segment(
         image_bytes: bytes,
         viewport_height: int,
@@ -688,60 +707,85 @@ class XiaoheihePlugin(Star):
         with Image.open(io.BytesIO(image_bytes)) as source:
             image = source.convert("RGB")
             scale_y = image.height / max(1, viewport_height)
-            top = max(0, round(crop_top * scale_y))
-            bottom = min(image.height, round((crop_top + crop_height) * scale_y))
-            if bottom <= top:
-                raise ValueError("Screenshot segment crop is empty")
+            top = round(crop_top * scale_y)
+            bottom = round((crop_top + crop_height) * scale_y)
+            if top < 0 or bottom > image.height or bottom <= top:
+                raise ValueError("Screenshot segment crop is outside the viewport")
             cropped = image.crop((0, top, image.width, bottom))
             output = io.BytesIO()
             cropped.save(output, format="PNG")
             return output.getvalue()
 
-    @staticmethod
+    @classmethod
     def _stitch_screenshot_segments(
+        cls,
         parts: list[tuple[int, bytes]],
         total_height: int,
         css_width: int = 430,
-        quality: int = 95,
     ) -> bytes:
-        """Stitch pre-cropped screenshot slices into one JPEG."""
+        """Map CSS boundaries onto a safe DPR2 canvas; keep the result lossless."""
         if not parts or total_height <= 0:
             raise ValueError("No screenshot segments to stitch")
 
         ordered_parts = sorted(parts, key=lambda item: item[0])
-        # Normalize to CSS pixels before joining. A context with DPR 2 or 3 can
-        # otherwise create a 60k+ physical-pixel canvas before QQ normalization.
-        output_width = max(1, int(css_width))
-        scale = 1.0
-        output_height = max(1, int(total_height))
-        stitched = Image.new("RGB", (output_width, output_height), "white")
-
+        if ordered_parts[0][0] != 0:
+            raise ValueError("Screenshot segments must start at CSS y=0")
+        physical_width = css_width * DEVICE_SCALE_FACTOR
+        output_width, output_height = cls._safe_image_size(
+            physical_width, total_height * DEVICE_SCALE_FACTOR,
+        )
+        regions = []
         for index, (css_y, image_bytes) in enumerate(ordered_parts):
-            top = max(0, round(css_y * scale))
-            next_css_y = (
-                ordered_parts[index + 1][0]
-                if index + 1 < len(ordered_parts)
-                else int(total_height)
-            )
-            bottom = min(output_height, round(next_css_y * scale))
-            expected_height = bottom - top
-            if expected_height <= 0:
-                continue
+            next_css_y = ordered_parts[index + 1][0] if index + 1 < len(parts) else total_height
+            if not 0 <= css_y < next_css_y <= total_height:
+                raise ValueError("Invalid screenshot segment boundaries")
             with Image.open(io.BytesIO(image_bytes)) as source:
-                image = source.convert("RGB")
-                if image.width != output_width or image.height != expected_height:
-                    image = image.resize(
-                        (output_width, expected_height),
-                        Image.Resampling.LANCZOS,
-                    )
-                stitched.paste(image, (0, top))
+                source_height = (next_css_y - css_y) * DEVICE_SCALE_FACTOR
+                if source.width != physical_width or source.height < source_height:
+                    raise ValueError("Screenshot segment does not cover its DPR2 region")
+                if source.height > source_height and index != len(parts) - 1:
+                    raise ValueError("Screenshot segments overlap")
+            regions.append((css_y * DEVICE_SCALE_FACTOR, next_css_y * DEVICE_SCALE_FACTOR, image_bytes))
+
+        # Decide the bounded canvas size before allocating it, even for a
+        # 100000 CSS px article. Scroll/crop coordinates always remain in CSS px.
+        stitched = Image.new("RGB", (output_width, output_height), "white")
+        physical_height = total_height * DEVICE_SCALE_FACTOR
+        scale_y = output_height / physical_height
+        needs_resize = (output_width, output_height) != (physical_width, physical_height)
+        # Lanczos needs neighbouring rows on BOTH sides of a segment boundary.
+        # Include its filter radius plus a rounding margin in source pixels.
+        padding = math.ceil(3 / scale_y) + 1 if needs_resize else 0
+        for start, end, _ in regions:
+            # Shared absolute boundaries prevent accumulated rounding error.
+            top = round(start * output_height / physical_height)
+            bottom = round(end * output_height / physical_height)
+            if bottom <= top:
+                continue
+            source_top = max(0, math.floor(top / scale_y) - padding)
+            source_bottom = min(physical_height, math.ceil(bottom / scale_y) + padding)
+            strip = Image.new("RGB", (physical_width, source_bottom - source_top), "white")
+            for region_top, region_bottom, image_bytes in regions:
+                overlap_top = max(source_top, region_top)
+                overlap_bottom = min(source_bottom, region_bottom)
+                if overlap_top >= overlap_bottom:
+                    continue
+                with Image.open(io.BytesIO(image_bytes)) as source:
+                    crop = source.crop((0, overlap_top - region_top, physical_width,
+                                        overlap_bottom - region_top)).convert("RGB")
+                    strip.paste(crop, (0, overlap_top - source_top))
+            if needs_resize:
+                # Use the same sampling grid as one whole-image resize without
+                # ever allocating that potentially enormous DPR2 source canvas.
+                strip = strip.resize(
+                    (output_width, bottom - top), Image.Resampling.LANCZOS,
+                    box=(0, top / scale_y - source_top,
+                         physical_width, bottom / scale_y - source_top),
+                )
+            stitched.paste(strip, (0, top))
 
         output = io.BytesIO()
-        stitched.save(
-            output,
-            format="JPEG",
-            quality=min(max(int(quality), 1), 95),
-        )
+        stitched.save(output, format="PNG")
         return output.getvalue()
 
     async def _capture_segmented_screenshot(
@@ -896,14 +940,14 @@ class XiaoheihePlugin(Star):
 
             viewport_png = await page.screenshot(
                 type="png",
-                scale="css",
+                scale="device",
                 animations="disabled",
                 caret="hide",
             )
             cropped_png = self._crop_screenshot_segment(
                 viewport_png,
                 viewport_height,
-                max(0.0, crop_top),
+                crop_top,
                 css_height,
             )
             parts.append((css_y, cropped_png))
@@ -914,7 +958,6 @@ class XiaoheihePlugin(Star):
             parts,
             total_height,
             css_width,
-            quality=self.image_quality,
         )
 
     async def _expand_article_text(self, page) -> dict:
@@ -1172,7 +1215,7 @@ class XiaoheihePlugin(Star):
         self._log("开始模拟滚动，加载图片...")
         await self._scroll_for_lazy_loading(page)
 
-        await asyncio.sleep(self.render_delay / 1000)
+        await asyncio.sleep(LAZY_RENDER_SETTLE_SECONDS)
         final_expand_result = expand_result
         if (
             not expand_result.get("matched")
@@ -1237,15 +1280,13 @@ class XiaoheihePlugin(Star):
                 yield result
 
     async def _process_screenshot(self, event: AstrMessageEvent, game: str):
-        short_timeout = max(3000, self.wait_timeout // 12)
-        mid_timeout = max(5000, self.wait_timeout // 6)
         context = None
         try:
             context = await self._create_context()
             page = await context.new_page()
 
             search_url = f"https://www.xiaoheihe.cn/app/search?q={quote(game)}"
-            await page.goto(search_url, wait_until="load", timeout=self.wait_timeout)
+            await page.goto(search_url, wait_until="load", timeout=PAGE_LOAD_TIMEOUT_MS)
 
             success = False
             selectors =[
@@ -1255,16 +1296,16 @@ class XiaoheihePlugin(Star):
             ]
             for sel in selectors:
                 try:
-                    await page.wait_for_selector(sel, timeout=short_timeout)
+                    await page.wait_for_selector(sel, timeout=SEARCH_SELECTOR_TIMEOUT_MS)
                     if sel == 'a[href*="/app/topic/game/"]':
                         href = await page.get_attribute(sel, "href")
-                        await page.goto(f"https://www.xiaoheihe.cn{href}", wait_until="load", timeout=self.wait_timeout)
+                        await page.goto(f"https://www.xiaoheihe.cn{href}", wait_until="load", timeout=PAGE_LOAD_TIMEOUT_MS)
                     else:
-                        async with page.expect_navigation(wait_until="load", timeout=self.wait_timeout):
+                        async with page.expect_navigation(wait_until="load", timeout=PAGE_LOAD_TIMEOUT_MS):
                             await page.click(sel)
                         if sel == ".search-topic__topic-name":
-                            await page.wait_for_selector(".slide-tab__tab-label", timeout=mid_timeout)
-                            async with page.expect_navigation(wait_until="load", timeout=self.wait_timeout):
+                            await page.wait_for_selector(".slide-tab__tab-label", timeout=GAME_TAB_TIMEOUT_MS)
+                            async with page.expect_navigation(wait_until="load", timeout=PAGE_LOAD_TIMEOUT_MS):
                                 await page.click(".slide-tab__tab-label")
                     success = True
                     break
@@ -1272,7 +1313,9 @@ class XiaoheihePlugin(Star):
                     continue
 
             if not success:
-                yield self._base64_image_result(event, await page.screenshot(full_page=True))
+                yield self._base64_image_result(
+                    event, await page.screenshot(type="png", full_page=True, scale="device")
+                )
                 return
 
             image_bytes = await self._prepare_and_screenshot(page)
@@ -1335,43 +1378,110 @@ class XiaoheihePlugin(Star):
         finally:
             if context: await context.close()
 
-    # ==================== 文件清理与生命周期 ====================
+    # ==================== 统一发送安全锁与生命周期 ====================
+
+    @staticmethod
+    def _encode_jpeg(image, quality: int) -> bytes:
+        output = io.BytesIO()
+        # Keep colour detail as well as luminance; all trials encode the same
+        # lossless pixels, never a previously encoded JPEG.
+        try:
+            image.save(output, format="JPEG", quality=quality, subsampling=0, optimize=True)
+        except OSError:
+            # Pillow's optimized encoder guesses a whole-image buffer which
+            # can be too small for high-entropy 4:4:4 JPEG at quality 100.
+            # Retry its streaming encoder at the SAME quality and pixels.
+            output = io.BytesIO()
+            image.save(output, format="JPEG", quality=quality, subsampling=0, optimize=False)
+        return output.getvalue()
+
+    def _highest_quality_jpeg(self, image) -> tuple[bytes | None, int]:
+        """Try 100 first, then search the integer quality range within the lock."""
+        encoded = self._encode_jpeg(image, 100)
+        if len(encoded) <= MAX_IMAGE_BYTES:
+            return encoded, 100
+
+        best = self._encode_jpeg(image, MIN_JPEG_QUALITY)
+        if len(best) > MAX_IMAGE_BYTES:
+            best = None
+        quality = MIN_JPEG_QUALITY
+        failed = {100}
+        low, high = MIN_JPEG_QUALITY + 1, 99 if best is not None else MIN_JPEG_QUALITY
+        while low <= high:
+            middle = (low + high) // 2
+            encoded = self._encode_jpeg(image, middle)
+            if len(encoded) <= MAX_IMAGE_BYTES:
+                best, quality = encoded, middle
+                low = middle + 1
+            else:
+                failed.add(middle)
+                high = middle - 1
+        # Optimized JPEG sizes can have local reversals. Verify the untested
+        # higher qualities before accepting a binary-search result (or reducing
+        # resolution). The complete search still has only 51 integer qualities.
+        for candidate_quality in range(99, quality, -1):
+            if candidate_quality in failed:
+                continue
+            encoded = self._encode_jpeg(image, candidate_quality)
+            if len(encoded) <= MAX_IMAGE_BYTES:
+                return encoded, candidate_quality
+        return best, quality
 
     def _normalize_for_qq(self, image_bytes: bytes) -> bytes:
-        """将截图转换为 QQ 富媒体服务较稳定接受的 JPEG 规格。"""
+        """Apply all three safety locks, then encode once from lossless pixels."""
         with Image.open(io.BytesIO(image_bytes)) as source:
             image = source.convert("RGB")
-            width, height = image.size
-            scale = min(
-                1.0,
-                self._max_image_dimension / max(width, height),
-                (self._max_image_pixels / (width * height)) ** 0.5,
-            )
-            if scale < 1.0:
-                new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
-                self._log(f"压缩截图尺寸: {width}x{height} -> {new_size[0]}x{new_size[1]}")
-                image = image.resize(new_size, Image.Resampling.LANCZOS)
+        size = self._safe_image_size(*image.size)
+        if size != image.size:
+            self._log(f"发送安全锁调整尺寸: {image.size} -> {size}")
+            image = image.resize(size, Image.Resampling.LANCZOS)
 
-            quality = min(max(self.image_quality, 1), 95)
-            while quality >= 50:
-                output = io.BytesIO()
-                image.save(output, format="JPEG", quality=quality, optimize=True)
-                normalized = output.getvalue()
-                if len(normalized) <= self._max_image_bytes or quality == 50:
-                    if len(normalized) > self._max_image_bytes:
-                        logger.warning(
-                            f"[小黑盒] 图片仍为 {len(normalized) / 1024 / 1024:.1f}MB，可能无法由 QQ 上传"
-                        )
-                    return normalized
-                quality = max(50, quality - 10)
-        return image_bytes
+        normalized, quality = self._highest_quality_jpeg(image)
+        if normalized is None:
+            # Even quality 50 exceeds 10 MiB. Search integer longest-edge sizes
+            # instead of taking arbitrary 10% steps. At most 14 trials with the
+            # 16384 edge lock; every trial resizes the same lossless source.
+            width, height = image.size
+            longest = max(width, height)
+            low, high = 1, longest - 1
+            best_size = None
+            while low <= high:
+                edge = (low + high) // 2
+                candidate_size = (
+                    max(1, width * edge // longest),
+                    max(1, height * edge // longest),
+                )
+                candidate = image.resize(candidate_size, Image.Resampling.LANCZOS)
+                encoded = self._encode_jpeg(candidate, MIN_JPEG_QUALITY)
+                if len(encoded) <= MAX_IMAGE_BYTES:
+                    best_size = candidate_size
+                    low = edge + 1
+                else:
+                    high = edge - 1
+            if best_size is None:
+                raise RuntimeError("Cannot encode an image within the QQ byte safety lock")
+            self._log(f"文件体积安全锁调整尺寸: {image.size} -> {best_size}")
+            image = image.resize(best_size, Image.Resampling.LANCZOS)
+            normalized, quality = self._highest_quality_jpeg(image)
+
+        # Fail closed: never let an encoder error or an oversized fallback
+        # bypass the same locks used by normal and search-failure screenshots.
+        if (
+            normalized is None
+            or len(normalized) > MAX_IMAGE_BYTES
+            or max(image.size) > MAX_IMAGE_DIMENSION
+            or image.width * image.height > MAX_IMAGE_PIXELS
+        ):
+            raise RuntimeError("Screenshot exceeds QQ image safety locks")
+        self._log(
+            f"最终 JPEG: {image.width}x{image.height}, quality={quality}, "
+            f"{len(normalized)} bytes"
+        )
+        return normalized
 
     def _base64_image_result(self, event: AstrMessageEvent, image_bytes: bytes):
         """直接发送 Base64 图片，避免 OneBot/NapCat 依赖临时文件 URI。"""
-        try:
-            image_bytes = self._normalize_for_qq(image_bytes)
-        except Exception as e:
-            self._log(f"图片规范化失败，将发送原始截图: {e}")
+        image_bytes = self._normalize_for_qq(image_bytes)
         return event.make_result().base64_image(
             base64.b64encode(image_bytes).decode("ascii")
         )

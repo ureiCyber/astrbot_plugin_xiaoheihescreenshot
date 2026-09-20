@@ -38,12 +38,13 @@ class _RowColourImage:
     def convert(self, _mode: str):
         return _RowColourImage(self.width, self.height, rows=self._rows)
 
-    def resize(self, size, _resample=None):
+    def resize(self, size, _resample=None, box=None):
         width, height = map(int, size)
         if height <= 0:
             raise ValueError("Image height must be positive")
+        source_top, source_bottom = (box[1], box[3]) if box else (0, self.height)
         rows = [
-            self._rows[min(self.height - 1, row * self.height // height)]
+            self._rows[min(self.height - 1, int(source_top + row * (source_bottom - source_top) / height))]
             for row in range(height)
         ]
         return _RowColourImage(width, height, rows=rows)
@@ -175,8 +176,21 @@ def _solid_image_bytes(colour, height: int, width: int = 430) -> bytes:
     return output.getvalue()
 
 
+def _row_colour(y):
+    return (y // 256 % 256, y % 256, 73)
+
+
+def _row_pattern_bytes(width, height, start=0):
+    image = IMAGE_BACKEND.new("RGB", (width, height))
+    for y in range(height):
+        image.paste(IMAGE_BACKEND.new("RGB", (width, 1), _row_colour(start + y)), (0, y))
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
+
+
 def _assert_colour_dominates(test: unittest.TestCase, actual, expected):
-    """Allow normal JPEG loss while still detecting the intended colour band."""
+    """Allow resampling at a seam while detecting the intended colour band."""
     expected_channel = expected.index(max(expected))
     test.assertGreater(actual[expected_channel], 180)
     for channel, value in enumerate(actual):
@@ -213,11 +227,13 @@ class _ConstrainedSegmentPage:
         raise AssertionError(f"Unexpected page.evaluate script: {script[:80]!r}")
 
     async def screenshot(self, **_kwargs):
+        if _kwargs.get("scale") != "device" or _kwargs.get("type") != "png":
+            raise AssertionError("Capture must retain device pixels in lossless PNG")
         self.screenshot_count += 1
         return _solid_image_bytes(
             (20 * self.screenshot_count, 80, 160),
-            self.viewport["height"],
-            self.viewport["width"],
+            self.viewport["height"] * 2,
+            self.viewport["width"] * 2,
         )
 
 
@@ -257,16 +273,95 @@ class ScreenshotSegmentPlanningTests(unittest.TestCase):
 
 
 class ScreenshotSegmentStitchingTests(unittest.TestCase):
+    def test_crop_uses_css_coordinates_and_keeps_every_device_row(self):
+        cropped = XiaoheihePlugin._crop_screenshot_segment(
+            _row_pattern_bytes(8, 40), viewport_height=20, crop_top=7.5, crop_height=9,
+        )
+        with IMAGE_BACKEND.open(io.BytesIO(cropped)) as image:
+            self.assertEqual(image.size, (8, 18))
+            self.assertEqual([image.getpixel((0, y)) for y in range(18)],
+                             [_row_colour(y) for y in range(15, 33)])
+
+    def test_crop_refuses_missing_rows(self):
+        with self.assertRaisesRegex(ValueError, "outside the viewport"):
+            XiaoheihePlugin._crop_screenshot_segment(
+                _solid_image_bytes((255, 0, 0), 40, 8), 20, 15, 6,
+            )
+
+    def test_final_excess_rows_are_cropped_instead_of_squeezed(self):
+        parts = [(0, _row_pattern_bytes(8, 40))]
+        stitched = XiaoheihePlugin._stitch_screenshot_segments(parts, 13, css_width=4)
+        with IMAGE_BACKEND.open(io.BytesIO(stitched)) as image:
+            self.assertEqual(image.size, (8, 26))
+            self.assertEqual([image.getpixel((0, y)) for y in range(26)],
+                             [_row_colour(y) for y in range(26)])
+
+    @unittest.skipUnless(isinstance(IMAGE_BACKEND, types.ModuleType), "Requires Pillow resampling")
+    def test_scaled_absolute_boundaries_match_whole_image_without_seams(self):
+        total = 10003
+        plans = XiaoheihePlugin._plan_screenshot_segments(total, 997)
+        colours = [(10 + index * 10, 80, 160) for index in range(len(plans))]
+        parts = [(top, _solid_image_bytes(colour, height * 2, 20))
+                 for (top, height), colour in zip(plans, colours)]
+        # Only the test builds an unbounded source canvas as a reference.
+        reference = IMAGE_BACKEND.new("RGB", (20, total * 2))
+        for (top, height), colour in zip(plans, colours):
+            reference.paste(IMAGE_BACKEND.new("RGB", (20, height * 2), colour), (0, top * 2))
+        reference = reference.resize((16, 16384), IMAGE_BACKEND.Resampling.LANCZOS)
+        stitched = XiaoheihePlugin._stitch_screenshot_segments(parts, total, css_width=10)
+        with IMAGE_BACKEND.open(io.BytesIO(stitched)) as image:
+            self.assertEqual(image.size, (16, 16384))
+            for y in range(image.height):
+                self.assertLessEqual(
+                    max(abs(a - b) for a, b in zip(image.getpixel((0, y)), reference.getpixel((0, y)))),
+                    1, f"row {y} differs from whole-image resampling",
+                )
+
+    @unittest.skipUnless(isinstance(IMAGE_BACKEND, types.ModuleType), "Requires Pillow resampling")
+    def test_scaled_fine_detail_across_segment_boundaries_matches_reference(self):
+        # A continuous row pattern exposes filtering discontinuities that solid
+        # colour bands alone would miss. Include an odd, very short last slice.
+        total = 8201
+        plans = XiaoheihePlugin._plan_screenshot_segments(total, 2000)
+        original_bytes = _row_pattern_bytes(8, total * 2)
+        parts = []
+        with IMAGE_BACKEND.open(io.BytesIO(original_bytes)) as original:
+            for top, height in plans:
+                output = io.BytesIO()
+                original.crop((0, top * 2, 8, (top + height) * 2)).save(output, format="PNG")
+                parts.append((top, output.getvalue()))
+            reference = original.resize((7, 16384), IMAGE_BACKEND.Resampling.LANCZOS)
+        result = XiaoheihePlugin._stitch_screenshot_segments(parts, total, css_width=4)
+        with IMAGE_BACKEND.open(io.BytesIO(result)) as image:
+            self.assertEqual(image.size, reference.size)
+            for y in range(image.height):
+                self.assertLessEqual(
+                    max(abs(a - b) for a, b in zip(image.getpixel((0, y)), reference.getpixel((0, y)))),
+                    1, f"row {y} differs from whole-image resampling",
+                )
+
+    def test_missing_duplicate_or_low_resolution_segments_are_rejected(self):
+        valid = _solid_image_bytes((255, 0, 0), 20, 8)
+        invalid_parts = [
+            [(1, valid)],
+            [(0, valid), (0, valid)],
+            [(0, _solid_image_bytes((255, 0, 0), 18, 8))],
+            [(0, _solid_image_bytes((255, 0, 0), 20, 4))],
+        ]
+        for parts in invalid_parts:
+            with self.subTest(parts=[top for top, _ in parts]), self.assertRaises(ValueError):
+                XiaoheihePlugin._stitch_screenshot_segments(parts, 10, css_width=4)
+
     def test_stitches_in_y_order_and_crops_the_last_part_to_total_height(self):
         red = (255, 0, 0)
         green = (0, 255, 0)
         blue = (0, 0, 255)
-        # Deliberately pass parts out of order and make the last source 2000 px
-        # tall.  Only the 501 px remainder belongs in the final image.
+        # Deliberately pass DPR2 parts out of order with an overlong last part.
+        # Only its first 1002 physical rows belong in the final image.
         parts = [
-            (4000, _solid_image_bytes(blue, 2000)),
-            (0, _solid_image_bytes(red, 2000)),
-            (2000, _solid_image_bytes(green, 2000)),
+            (4000, _solid_image_bytes(blue, 4000, 860)),
+            (0, _solid_image_bytes(red, 4000, 860)),
+            (2000, _solid_image_bytes(green, 4000, 860)),
         ]
 
         stitched_bytes = XiaoheihePlugin._stitch_screenshot_segments(
@@ -276,14 +371,14 @@ class ScreenshotSegmentStitchingTests(unittest.TestCase):
         )
 
         with IMAGE_BACKEND.open(io.BytesIO(stitched_bytes)) as stitched:
-            self.assertEqual(stitched.size, (430, 4501))
+            self.assertEqual(stitched.size, (860, 9002))
             samples = [
                 (0, red),
-                (1999, red),
-                (2000, green),
-                (3999, green),
-                (4000, blue),
-                (4500, blue),
+                (3999, red),
+                (4000, green),
+                (7999, green),
+                (8000, blue),
+                (9001, blue),
             ]
             for y, expected in samples:
                 with self.subTest(y=y):
@@ -291,9 +386,30 @@ class ScreenshotSegmentStitchingTests(unittest.TestCase):
 
 
 class ScreenshotSegmentCaptureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_capture_keeps_dpr2_rows_without_repeating_the_last_viewport(self):
+        class RowPage(_ConstrainedSegmentPage):
+            async def screenshot(self, **kwargs):
+                if kwargs.get("scale") != "device":
+                    raise AssertionError("DPR must be preserved")
+                return _row_pattern_bytes(
+                    self.viewport["width"] * 2, self.viewport["height"] * 2,
+                    self.scroll_requests[-1] * 2,
+                )
+
+        plugin = XiaoheihePlugin.__new__(XiaoheihePlugin)
+        plugin._log = lambda _message: None
+        page = RowPage(2005)
+        result = await plugin._capture_segmented_screenshot(
+            page, content_height=2005, css_width=4, segment_height=777,
+        )
+        self.assertEqual(page.scroll_requests, [0, 777, 1228])
+        with IMAGE_BACKEND.open(io.BytesIO(result)) as image:
+            self.assertEqual(image.size, (8, 4010))
+            self.assertEqual([image.getpixel((0, y)) for y in range(image.height)],
+                             [_row_colour(y) for y in range(4010)])
+
     async def _capture(self, geometry_height: int):
         plugin = XiaoheihePlugin.__new__(XiaoheihePlugin)
-        plugin.image_quality = 92
         logs = []
         plugin._log = logs.append
         page = _ConstrainedSegmentPage(geometry_height)
@@ -314,11 +430,10 @@ class ScreenshotSegmentCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page.screenshot_count, 6)
         self.assertEqual(page.scroll_requests, [0, 2000, 4000, 6000, 8000, 8911])
         with IMAGE_BACKEND.open(io.BytesIO(image_bytes)) as image:
-            self.assertEqual(image.size, (430, 10_911))
+            self.assertEqual(image.size, (645, 16_384))
 
     async def test_unexpandable_layout_refuses_to_crop_article(self):
         plugin = XiaoheihePlugin.__new__(XiaoheihePlugin)
-        plugin.image_quality = 92
         logs = []
         plugin._log = logs.append
         page = _ConstrainedSegmentPage(9_589)

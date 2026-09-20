@@ -97,7 +97,7 @@ class FastFinishPlugin(XiaoheihePlugin):
 
 
 async def _yield_without_render_delay(_delay):
-    """Let scheduled response inspection run without a 1.5 second page delay."""
+    """Let scheduled response inspection run without the app-settle delay."""
     await _REAL_ASYNCIO_SLEEP(0)
 
 
@@ -143,8 +143,6 @@ class OpenLinkPageWithCaptureTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.plugin = FastFinishPlugin.__new__(FastFinishPlugin)
         self.plugin.debug = False
-        self.plugin.wait_timeout = 1000
-        self.plugin.render_delay = 0
         self.plugin.capture_states = []
         self.target_url = "https://www.xiaoheihe.cn/app/bbs/link/test-post"
         self.empty_snapshot = {

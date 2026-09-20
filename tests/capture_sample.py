@@ -55,11 +55,12 @@ def load_plugin():
         raise RuntimeError(f"Cannot load {module_path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.XiaoheihePlugin
+    return module
 
 
 async def capture(url: str, output: Path, chrome: Path) -> None:
-    plugin_class = load_plugin()
+    module = load_plugin()
+    plugin_class = module.XiaoheihePlugin
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
             headless=True,
@@ -67,19 +68,12 @@ async def capture(url: str, output: Path, chrome: Path) -> None:
         )
         plugin = plugin_class.__new__(plugin_class)
         plugin.cookies = ""
-        plugin.wait_timeout = 60_000
-        plugin.render_delay = 5_000
-        plugin.device_scale_factor = 1
-        plugin.image_quality = 92
         plugin.debug = True
-        plugin._max_image_dimension = 16_384
-        plugin._max_image_pixels = 20_000_000
-        plugin._max_image_bytes = 10 * 1024 * 1024
         plugin._browser = browser
 
         context = await browser.new_context(
             viewport={"width": 430, "height": 932},
-            device_scale_factor=1,
+            device_scale_factor=module.DEVICE_SCALE_FACTOR,
             user_agent=(
                 "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
                 "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 "
@@ -92,6 +86,7 @@ async def capture(url: str, output: Path, chrome: Path) -> None:
             page = await context.new_page()
             state = await plugin._open_link_page_with_capture(page, url)
             image_bytes = await plugin._prepare_and_screenshot(page, state)
+            image_bytes = plugin._normalize_for_qq(image_bytes)
             diagnostics = await page.evaluate(
                 """() => {
                     const slides = Array.from(document.querySelectorAll(
@@ -204,7 +199,11 @@ async def capture(url: str, output: Path, chrome: Path) -> None:
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_bytes(image_bytes)
             with Image.open(output) as image:
-                print(f"SAMPLE {output} {image.width}x{image.height} {output.stat().st_size} bytes")
+                print(
+                    f"SAMPLE {output} {image.width}x{image.height} "
+                    f"{image.format} DPR={module.DEVICE_SCALE_FACTOR} "
+                    f"{output.stat().st_size} bytes"
+                )
         finally:
             await context.close()
             await browser.close()

@@ -97,8 +97,6 @@ class _PrepareProbePlugin(XiaoheihePlugin):
     def __init__(self, expand_results, trace):
         # Avoid Star/AstrBot construction; only the fields used by
         # _prepare_and_screenshot are needed for this orchestration test.
-        self.render_delay = 0
-        self.image_quality = 92
         self.debug = False
         self.expand_results = list(expand_results)
         self.trace = trace
